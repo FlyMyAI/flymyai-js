@@ -1,6 +1,6 @@
 {
-  "name": "@aykes/mylibnpm",
-  "version": "0.1.5",
+  "name": "flymyai",
+  "version": "1.0.0",
   "description": "Description",
   "main": "dist/my-library.umd.js",
   "module": "dist/my-library.esm.js",
