@@ -1,16 +1,17 @@
 {
-  "name": "flymyai",
-  "version": "1.0.0",
-  "description": "Description",
+  "name": "flymyai-js-client",
+  "version": "0.1.51",
+  "description": "",
   "main": "dist/my-library.umd.js",
   "module": "dist/my-library.esm.js",
-  "type": "dist/index.d.ts",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "rollup -c"
   },
   "author": "Aykes",
   "license": "MIT",
   "devDependencies": {
+    "@rollup/plugin-typescript": "^12.1.2",
     "@types/jest": "^29.5.12",
     "jest": "^29.7.0",
     "rollup": "^4.18.1",

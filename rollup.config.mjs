@@ -6,12 +6,12 @@ export default {
   output: [{
     file: 'dist/my-library.umd.js',
     format: 'umd',
-    name: 'flymyai',
+    name: 'flymyai-js-client',
   },
   {
     file: 'dist/my-library.emd.js',
     format: 'esm',
-    name: 'flymyai',
+    name: 'MyLibrary',
   }],
   plugins: [
     resolve(),

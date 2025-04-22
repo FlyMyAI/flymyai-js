@@ -7,13 +7,13 @@ This repository contains the FlyMyAI SDK, a TypeScript library for interacting w
 To install the SDK, use npm or yarn:
 
 ```bash
-npm install flymyai
+npm install flymyai-js-client
 ```
 
 or
 
 ```bash
-yarn add flymyai
+yarn add flymyai-js-client
 ```
 
 ## Usage
@@ -23,9 +23,9 @@ yarn add flymyai
 To use the FlyMyAI SDK, you need to initialize it with your API key.
 
 ```typescript
-import { FlyMyAI } from 'flymyai';
+import { FlyMyAI } from 'flymyai-js-client';
 
-const flyMyAI = new FlyMyAI({ apiKey: 'YOUR_API_KEY' });
+const client = new FlyMyAI({ apiKey: 'YOUR_API_KEY' });
 ```
 
 ### Making Predictions
@@ -34,18 +34,23 @@ You can make predictions by calling the `predict` method. Here’s an example:
 
 ```typescript
 const payload = {
-    i_prompt: 'An astronaut riding a rainbow unicorn, cinematic, dramatic, photorealistic',
-    i_negative_prompt: 'Dark colors, gloomy atmosphere, horror'
-};
+  "prompt": "Funny cat with stupid dog",
+  "height": 1024,
+  "width": 1024,
+  "num_inference_steps": 26,
+  "guidance_scale": "0",
+  "seed": 1654,
+  "negative_prompt": "0"
+}
 
-const model = 'flymyai/SDTurboFMAAceleratedH100';
+const model = 'flymyai/HiDream-I1-dev';
 const apiKey = process.env.REACT_APP_FLYMYAI_API_KEY || '';
 
 const client = new FlyMyAI({ apiKey });
 
 try {
     const result = await client.predict(payload, model);
-    console.log('Prediction result:', result.output_data?.output[0]);
+    console.log('Prediction result:', result.output_data['sample'][0]);
 } catch (error) {
     console.error('Error making prediction:', error);
 }
@@ -65,7 +70,7 @@ const model = 'flymyai/SDTurboFMAAceleratedH100';
 
 async function streamPredictions() {
     try {
-        for await (const result of flyMyAI.stream(payload, model)) {
+        for await (const result of client.stream(payload, model)) {
             console.log('Streaming result:', (result.output_data?.output || [])[0] || '');
         }
     } catch (error) {
