@@ -6,7 +6,7 @@ import {
 } from "eventsource-parser";
 
 interface FlyMyAIConfig {
-  apiKey: string | undefined;
+  apiKey: string;
 }
 
 interface FlyMyAIResponse {
@@ -85,17 +85,11 @@ class FlyMyAI {
     });
   }
 
-  private async _preparePayload(payload: any): Promise<any> {
+  private async _preparePayload(payload: any) {
     if (payload.image && payload.image instanceof File) {
       payload.image = await this._convertImageToBase64(payload.image);
     }
     return payload;
-  }
-
-  private _validateModelFormat(model: string) {
-    if (!model.includes("/")) {
-      throw new FlyMyAIError('Model must be in the format "user/modelName".');
-    }
   }
 
   async _createConnection(
@@ -105,30 +99,41 @@ class FlyMyAI {
   ): Promise<Response> {
     this._validateModelFormat(model);
     const [user, modelName] = model.split("/");
-    payload = await this._preparePayload(payload);
+    const preparedPayload = await this._preparePayload(payload);
+    const formData = new FormData();
+    for (const key in preparedPayload) {
+      formData.append(key, payload[key]);
+    }
+
+    const headers = new Headers({
+      "x-api-key": this.apiKey,
+      accept: stream ? "text/event-stream" : "application/json",
+    });
 
     const response = await fetch(
       `${this.baseUrl}/${user}/${modelName}/predict${stream ? "/stream/" : ""}`,
       {
         method: "POST",
-        headers: {
-          "x-api-key": this.apiKey,
-          "content-type": "application/json",
-          accept: stream ? "text/event-stream" : "application/json",
-        },
-        body: JSON.stringify({ ...payload }),
+        headers,
+        body: formData,
       }
     );
 
     if (!response.ok) {
+      const errorBody = await response.text();
       throw new FlyMyAIError(
-        `Failed to create connection. Server responded with status: ${response.statusText}`
+        `Request failed: ${response.status} ${response.statusText}. Body: ${errorBody}`
       );
     }
 
     return response;
   }
 
+  private _validateModelFormat(model: string) {
+    if (!model.includes("/")) {
+      throw new FlyMyAIError('Model must be in the format "user/modelName".');
+    }
+  }
   async _createConnectionWithRetries(
     payload: any,
     model: string,
@@ -171,28 +176,45 @@ class FlyMyAI {
 
   async predict<T = PredictionResult>(payload: any, model: string): Promise<T> {
     try {
-      const response = await this._createConnectionWithRetries(payload, model);
+      const response = await this._createConnection(payload, model);
+
+      // Если ответ приходит как SSE (даже для обычных запросов)
       const reader = response.body?.getReader();
       const decoder = new TextDecoder("utf-8");
       let result = "";
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          result += decoder.decode(value, { stream: true });
-        }
+      if (!reader) {
+        throw new FlyMyAIError("Failed to read response stream");
       }
 
-      const jsonString = result
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        result += decoder.decode(value);
+      }
+
+      // Извлекаем данные из SSE формата
+      const jsonData = result
         .split("\n")
         .filter((line) => line.startsWith("data:"))
-        .map((line) => line.replace(/^data:\s*/, ""))
-        .join("");
+        .map((line) => {
+          try {
+            return JSON.parse(line.replace(/^data:\s*/, ""));
+          } catch (e) {
+            throw new FlyMyAIError(`Failed to parse SSE data: ${line}`);
+          }
+        });
 
-      const resultJSON = JSON.parse(jsonString);
-      return resultJSON;
+      if (jsonData.length === 0) {
+        throw new FlyMyAIError("No valid data events found in response");
+      }
+
+      // Возвращаем последнее событие (или обрабатываем все)
+      return jsonData[jsonData.length - 1] as T;
     } catch (error) {
+      if (error instanceof FlyMyAIError) {
+        throw error;
+      }
       if (error instanceof Error) {
         throw new FlyMyAIError(`Prediction failed: ${error.message}`);
       } else {

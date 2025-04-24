@@ -1,6 +1,6 @@
 {
   "name": "flymyai-js-client",
-  "version": "0.1.51",
+  "version": "0.1.9",
   "description": "",
   "main": "dist/my-library.umd.js",
   "module": "dist/my-library.esm.js",
@@ -26,6 +26,7 @@
     "@rollup/plugin-node-resolve": "^15.2.3",
     "eventsource": "^2.0.2",
     "eventsource-parser": "^1.1.2",
+    "flymyai-js-client": "^0.1.52",
     "rollup-plugin-node-resolve": "^5.2.0"
   }
 }
