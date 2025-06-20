@@ -1,0 +1,32 @@
+{
+  "name": "flymyai-js-client",
+  "version": "0.2.4",
+  "description": "",
+  "main": "dist/my-library.umd.js",
+  "module": "dist/my-library.esm.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "rollup -c"
+  },
+  "author": "Aykes",
+  "license": "MIT",
+  "devDependencies": {
+    "@rollup/plugin-typescript": "^12.1.2",
+    "@types/jest": "^29.5.12",
+    "jest": "^29.7.0",
+    "rollup": "^4.18.1",
+    "rollup-plugin-typescript2": "^0.36.0",
+    "ts-jest": "^29.2.2",
+    "tslib": "^2.6.3",
+    "typescript": "^5.5.3"
+  },
+  "dependencies": {
+    "@microsoft/fetch-event-source": "^2.0.1",
+    "@rollup/plugin-commonjs": "^26.0.1",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "eventsource": "^2.0.2",
+    "eventsource-parser": "^1.1.2",
+    "flymyai-js-client": "^0.1.52",
+    "rollup-plugin-node-resolve": "^5.2.0"
+  }
+}
