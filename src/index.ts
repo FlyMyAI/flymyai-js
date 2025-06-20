@@ -21,6 +21,26 @@ export interface PredictionResult {
   [key: string]: any;
 }
 
+export interface AsyncPredictionResult {
+  inference_responses?: Array<{
+    infer_details: {
+      status: number;
+      inference_time?: number;
+    };
+    response: {
+      detail?: string;
+      [key: string]: any;
+    };
+    [key: string]: any;
+  }>;
+  [key: string]: any;
+}
+
+interface AsyncPredictionOptions {
+  interval?: number;
+  signal?: AbortSignal;
+}
+
 class OpenAPISchemaResponse {
   exc_history?: any[];
   openapi_schema: Record<string, any>;
@@ -66,6 +86,134 @@ class FlyMyAI {
       );
     }
     this.apiKey = config.apiKey;
+  }
+
+  /**
+   * Создает асинхронный запрос предсказания
+   * @param payload Данные для предсказания
+   * @param model Модель в формате "user/modelName"
+   * @returns prediction_id идентификатор запроса
+   */
+  async asyncPredict(payload: any, model: string): Promise<string> {
+    this._validateModelFormat(model);
+    const [user, modelName] = model.split("/");
+    const preparedPayload = await this._preparePayload(payload);
+
+    const formData = new FormData();
+    for (const key in preparedPayload) {
+      formData.append(key, preparedPayload[key]);
+    }
+
+    const headers = new Headers({
+      "x-api-key": this.apiKey,
+      accept: "application/json",
+    });
+
+    const response = await fetch(
+      `${this.baseUrl}/${user}/${modelName}/predict/async/`,
+      {
+        method: "POST",
+        headers,
+        body: formData,
+      }
+    );
+
+    if (response.status !== 202) {
+      const errorBody = await response.text();
+      throw new FlyMyAIError(
+        `Async prediction failed: ${response.status} ${response.statusText}. Body: ${errorBody}`
+      );
+    }
+
+    const responseData = await response.json();
+    if (!responseData.prediction_id) {
+      throw new FlyMyAIError("Missing prediction_id in response");
+    }
+
+    return responseData.prediction_id;
+  }
+
+  /**
+   * Проверяет статус асинхронного запроса
+   * @param model Модель в формате "user/modelName"
+   * @param prediction_id Идентификатор запроса
+   * @param signal Сигнал для отмены запроса
+   * @returns Результат или статус pending
+   */
+  async checkAsyncResult(
+    model: string,
+    prediction_id: string,
+    signal?: AbortSignal
+  ): Promise<any> {
+    this._validateModelFormat(model);
+    const [user, modelName] = model.split("/");
+
+    const headers = new Headers({
+      "x-api-key": this.apiKey,
+      accept: "application/json",
+    });
+
+    const url = new URL(
+      `${this.baseUrl}/${user}/${modelName}/predict/async/result/`
+    );
+    url.searchParams.append("request_id", prediction_id);
+
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers,
+      signal,
+    });
+
+    if (response.status === 425) {
+      return { status: "pending" };
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new FlyMyAIError(
+        `Async check failed: ${response.status} ${response.statusText}. Body: ${errorBody}`
+      );
+    }
+
+    return await response.json();
+  }
+
+  /**
+   * Полный цикл асинхронного предсказания
+   * @param payload Данные для предсказания
+   * @param model Модель в формате "user/modelName"
+   * @param options Настройки { interval: интервал опроса, signal: сигнал отмены }
+   * @returns Результат предсказания
+   */
+  async predictAsync<T = any>(
+    payload: any,
+    model: string,
+    options: { interval?: number; signal?: AbortSignal } = {}
+  ): Promise<T> {
+    const { interval = 5000, signal } = options;
+    const predictionId = await this.asyncPredict(payload, model);
+
+    while (true) {
+      if (signal?.aborted) throw new FlyMyAIError("Request aborted");
+
+      const result = await this.checkAsyncResult(model, predictionId, signal);
+
+      if (result.status === "pending") {
+        await new Promise((resolve) => setTimeout(resolve, interval));
+        continue;
+      }
+
+      const inference = result.inference_responses?.[0];
+      if (inference?.infer_details?.status === 200) {
+        return result as T;
+      }
+
+      const errorMessage =
+        inference?.response?.detail ||
+        inference?.error ||
+        "Unknown inference error";
+      throw new FlyMyAIError(errorMessage);
+    }
   }
 
   private async _convertImageToBase64(image: File): Promise<string> {
