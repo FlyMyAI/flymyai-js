@@ -208,7 +208,14 @@ function errorMessage(error: unknown): string {
 /** A data event that reports an error (status >= 400, or details on a 200). */
 function isErrorEvent(data: any): boolean {
   if (!data || typeof data !== "object") return false;
-  const status = typeof data.status === "number" ? data.status : 200;
+  // "status" and "details" in the pods' events, "status_code" and "detail" in the
+  // gateway's error events (predict on a streaming model answers 200 with one).
+  const status =
+    typeof data.status === "number"
+      ? data.status
+      : typeof data.status_code === "number"
+        ? data.status_code
+        : 200;
   return status >= 400 || data.details != null;
 }
 

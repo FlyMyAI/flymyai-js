@@ -219,42 +219,215 @@
             this.name = "FlyMyAIError";
         }
     }
+    /** An HTTP error status that was not (or no longer) worth another attempt. */
+    class FlyMyAIAPIError extends FlyMyAIError {
+        constructor(message, status, body, headers) {
+            super(message);
+            this.name = "FlyMyAIAPIError";
+            this.status = status;
+            this.body = body;
+            this.headers = headers;
+        }
+    }
+    /**
+     * The server reported an error inside a stream that had already started (an SSE event
+     * with an error status after HTTP 200). Not sent again: the request reached the model.
+     */
+    class FlyMyAIStreamError extends FlyMyAIError {
+        constructor(message, eventsReceived, data) {
+            super(message);
+            this.name = "FlyMyAIStreamError";
+            this.eventsReceived = eventsReceived;
+            this.data = data;
+        }
+    }
+    /**
+     * The connection broke after the stream had delivered at least one event. The SDK
+     * never sends such a stream again by itself (the model may still be running, and a
+     * second run would repeat the output and its cost), as the official OpenAI and
+     * Anthropic SDKs do not; retry yourself if a second run is acceptable.
+     */
+    class FlyMyAIStreamInterrupted extends FlyMyAIError {
+        constructor(message, eventsReceived, cause) {
+            super(message);
+            this.name = "FlyMyAIStreamInterrupted";
+            this.eventsReceived = eventsReceived;
+            this.cause = cause;
+        }
+    }
+    /** An SSE event whose data is not JSON: a malformed answer, not a broken connection. */
+    class FlyMyAISSEParseError extends FlyMyAIError {
+        constructor(message) {
+            super(message);
+            this.name = "FlyMyAISSEParseError";
+        }
+    }
+    // The retry policy of the official OpenAI and Anthropic SDKs: another attempt only
+    // before the answer started; the server decides with `x-should-retry` (or a JSON body
+    // with "retry_safe": false); otherwise 408, 409, 429 and every status from 500 retry;
+    // the wait honours `retry-after-ms` / `retry-after` up to two minutes, else
+    // exponential backoff from 0.5 s to 8 s less up to 25%.
+    const INITIAL_RETRY_DELAY_MS = 500;
+    const MAX_RETRY_DELAY_MS = 8000;
+    const MAX_RETRY_AFTER_MS = 120000;
+    const DEFAULT_MAX_RETRIES = 2;
+    const DEFAULT_TIMEOUT_MS = 600000;
+    const FINAL_CONFLICT_CODES = ["idempotency_key_reused", "tool_outcome_unknown"];
+    function shouldRetryStatus(status, headers, body) {
+        const header = (headers.get("x-should-retry") || "").trim().toLowerCase();
+        if (header === "true")
+            return true;
+        if (header === "false")
+            return false;
+        try {
+            const parsed = JSON.parse(body);
+            if (parsed && typeof parsed === "object") {
+                if (parsed.retry_safe === false)
+                    return false;
+                if (FINAL_CONFLICT_CODES.includes(parsed.code))
+                    return false;
+            }
+        }
+        catch (_) {
+            // not JSON
+        }
+        return status === 408 || status === 409 || status === 429 || status >= 500;
+    }
+    function retryAfterMs(headers) {
+        if (!headers)
+            return null;
+        const ms = Number.parseFloat(headers.get("retry-after-ms") || "");
+        if (Number.isFinite(ms))
+            return ms;
+        const raw = headers.get("retry-after");
+        if (!raw)
+            return null;
+        const seconds = Number.parseFloat(raw);
+        if (Number.isFinite(seconds))
+            return seconds * 1000;
+        const date = Date.parse(raw);
+        return Number.isFinite(date) ? date - Date.now() : null;
+    }
+    function retryDelayMs(retriesDone, headers) {
+        const serverWait = retryAfterMs(headers);
+        if (serverWait !== null && serverWait > 0 && serverWait <= MAX_RETRY_AFTER_MS) {
+            return serverWait;
+        }
+        const backoff = Math.min(INITIAL_RETRY_DELAY_MS * Math.pow(2, Math.max(retriesDone, 0)), MAX_RETRY_DELAY_MS);
+        return backoff * (1 - 0.25 * Math.random());
+    }
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    function newIdempotencyKey() {
+        const cryptoObj = globalThis.crypto;
+        if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+            return `flymyai-js-${cryptoObj.randomUUID()}`;
+        }
+        const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+        return `flymyai-js-${hex}`;
+    }
+    function errorMessage(error) {
+        return error instanceof Error ? error.message : String(error);
+    }
+    /** A data event that reports an error (status >= 400, or details on a 200). */
+    function isErrorEvent(data) {
+        if (!data || typeof data !== "object")
+            return false;
+        // "status" and "details" in the pods' events, "status_code" and "detail" in the
+        // gateway's error events (predict on a streaming model answers 200 with one).
+        const status = typeof data.status === "number"
+            ? data.status
+            : typeof data.status_code === "number"
+                ? data.status_code
+                : 200;
+        return status >= 400 || data.details != null;
+    }
     class FlyMyAI {
         constructor(config) {
+            var _a, _b;
             this.baseUrl = "https://api.flymy.ai/api/v1";
             if (!config.apiKey) {
                 throw new FlyMyAIError("API key not found. Please provide a valid API key.");
             }
             this.apiKey = config.apiKey;
+            this.maxRetries = (_a = config.maxRetries) !== null && _a !== void 0 ? _a : DEFAULT_MAX_RETRIES;
+            this.timeout = (_b = config.timeout) !== null && _b !== void 0 ? _b : DEFAULT_TIMEOUT_MS;
+            if (config.baseUrl)
+                this.baseUrl = config.baseUrl.replace(/\/$/, "");
+        }
+        /**
+         * One request with the retry policy. Returns the response once its headers arrived
+         * with an accepted status; the body is the caller's. An attempt that times out is
+         * aborted before the next one starts, so two attempts never run at once.
+         */
+        _send(url_1, init_1) {
+            return __awaiter(this, arguments, void 0, function* (url, init, options = {}) {
+                var _a, _b, _c, _d, _e, _f, _g;
+                const maxRetries = (_a = options.maxRetries) !== null && _a !== void 0 ? _a : this.maxRetries;
+                const accept = (_b = options.accept) !== null && _b !== void 0 ? _b : ((status) => status >= 200 && status < 300);
+                for (let attempt = 0;; attempt++) {
+                    if ((_c = options.signal) === null || _c === void 0 ? void 0 : _c.aborted)
+                        throw new FlyMyAIError("Request aborted");
+                    const controller = new AbortController();
+                    const onAbort = () => controller.abort();
+                    (_d = options.signal) === null || _d === void 0 ? void 0 : _d.addEventListener("abort", onAbort);
+                    const timer = setTimeout(() => controller.abort(), this.timeout);
+                    let response;
+                    try {
+                        response = yield fetch(url, Object.assign(Object.assign({}, init), { signal: controller.signal }));
+                    }
+                    catch (error) {
+                        clearTimeout(timer);
+                        (_e = options.signal) === null || _e === void 0 ? void 0 : _e.removeEventListener("abort", onAbort);
+                        if ((_f = options.signal) === null || _f === void 0 ? void 0 : _f.aborted)
+                            throw new FlyMyAIError("Request aborted");
+                        if (attempt < maxRetries) {
+                            yield sleep(retryDelayMs(attempt));
+                            continue;
+                        }
+                        throw new FlyMyAIError(`Request failed after ${attempt + 1} attempt(s): ${errorMessage(error)}`);
+                    }
+                    clearTimeout(timer);
+                    if (accept(response.status)) {
+                        return response;
+                    }
+                    (_g = options.signal) === null || _g === void 0 ? void 0 : _g.removeEventListener("abort", onAbort);
+                    const body = yield response.text().catch(() => "");
+                    if (attempt < maxRetries && shouldRetryStatus(response.status, response.headers, body)) {
+                        yield sleep(retryDelayMs(attempt, response.headers));
+                        continue;
+                    }
+                    throw new FlyMyAIAPIError(`Request failed: ${response.status} ${response.statusText}. Body: ${body}`, response.status, body, response.headers);
+                }
+            });
+        }
+        _headers(accept, extra = {}) {
+            return new Headers(Object.assign({ "x-api-key": this.apiKey, accept }, extra));
+        }
+        _formData(payload) {
+            const formData = new FormData();
+            for (const key in payload) {
+                formData.append(key, payload[key]);
+            }
+            return formData;
         }
         /**
          * Создает асинхронный запрос предсказания
          * @param payload Данные для предсказания
          * @param model Модель в формате "user/modelName"
+         * @param options { idempotencyKey } один ключ на все попытки (по умолчанию новый)
          * @returns prediction_id идентификатор запроса
          */
-        asyncPredict(payload, model) {
-            return __awaiter(this, void 0, void 0, function* () {
+        asyncPredict(payload_1, model_1) {
+            return __awaiter(this, arguments, void 0, function* (payload, model, options = {}) {
                 this._validateModelFormat(model);
                 const [user, modelName] = model.split("/");
                 const preparedPayload = yield this._preparePayload(payload);
-                const formData = new FormData();
-                for (const key in preparedPayload) {
-                    formData.append(key, preparedPayload[key]);
-                }
-                const headers = new Headers({
-                    "x-api-key": this.apiKey,
-                    accept: "application/json",
+                // One key for every attempt: a submit sent again after a lost answer replays
+                // the first job instead of starting a second paid one.
+                const headers = this._headers("application/json", {
+                    "Idempotency-Key": options.idempotencyKey || newIdempotencyKey(),
                 });
-                const response = yield fetch(`${this.baseUrl}/${user}/${modelName}/predict/async/`, {
-                    method: "POST",
-                    headers,
-                    body: formData,
-                });
-                if (response.status !== 202) {
-                    const errorBody = yield response.text();
-                    throw new FlyMyAIError(`Async prediction failed: ${response.status} ${response.statusText}. Body: ${errorBody}`);
-                }
+                const response = yield this._send(`${this.baseUrl}/${user}/${modelName}/predict/async/`, { method: "POST", headers, body: this._formData(preparedPayload) }, { accept: (status) => status === 202 || status === 200 });
                 const responseData = yield response.json();
                 if (!responseData.prediction_id) {
                     throw new FlyMyAIError("Missing prediction_id in response");
@@ -273,23 +446,11 @@
             return __awaiter(this, void 0, void 0, function* () {
                 this._validateModelFormat(model);
                 const [user, modelName] = model.split("/");
-                const headers = new Headers({
-                    "x-api-key": this.apiKey,
-                    accept: "application/json",
-                });
                 const url = new URL(`${this.baseUrl}/${user}/${modelName}/predict/async/result/`);
                 url.searchParams.append("request_id", prediction_id);
-                const response = yield fetch(url.toString(), {
-                    method: "GET",
-                    headers,
-                    signal,
-                });
+                const response = yield this._send(url.toString(), { method: "GET", headers: this._headers("application/json") }, { signal, accept: (status) => status === 425 || (status >= 200 && status < 300) });
                 if (response.status === 425) {
                     return { status: "pending" };
-                }
-                if (!response.ok) {
-                    const errorBody = yield response.text();
-                    throw new FlyMyAIError(`Async check failed: ${response.status} ${response.statusText}. Body: ${errorBody}`);
                 }
                 return yield response.json();
             });
@@ -298,20 +459,22 @@
          * Полный цикл асинхронного предсказания
          * @param payload Данные для предсказания
          * @param model Модель в формате "user/modelName"
-         * @param options Настройки { interval: интервал опроса, signal: сигнал отмены }
+         * @param options Настройки { interval: интервал опроса, signal: сигнал отмены, idempotencyKey }
          * @returns Результат предсказания
          */
         predictAsync(payload_1, model_1) {
             return __awaiter(this, arguments, void 0, function* (payload, model, options = {}) {
                 var _a, _b, _c;
                 const { interval = 5000, signal } = options;
-                const predictionId = yield this.asyncPredict(payload, model);
+                const predictionId = yield this.asyncPredict(payload, model, {
+                    idempotencyKey: options.idempotencyKey,
+                });
                 while (true) {
                     if (signal === null || signal === void 0 ? void 0 : signal.aborted)
                         throw new FlyMyAIError("Request aborted");
                     const result = yield this.checkAsyncResult(model, predictionId, signal);
                     if (result.status === "pending") {
-                        yield new Promise((resolve) => setTimeout(resolve, interval));
+                        yield sleep(interval);
                         continue;
                     }
                     const inference = (_a = result.inference_responses) === null || _a === void 0 ? void 0 : _a[0];
@@ -341,7 +504,9 @@
         }
         _preparePayload(payload) {
             return __awaiter(this, void 0, void 0, function* () {
-                if (payload.image && payload.image instanceof File) {
+                if (typeof File !== "undefined" &&
+                    payload.image &&
+                    payload.image instanceof File) {
                     payload.image = yield this._convertImageToBase64(payload.image);
                 }
                 return payload;
@@ -352,24 +517,11 @@
                 this._validateModelFormat(model);
                 const [user, modelName] = model.split("/");
                 const preparedPayload = yield this._preparePayload(payload);
-                const formData = new FormData();
-                for (const key in preparedPayload) {
-                    formData.append(key, payload[key]);
-                }
-                const headers = new Headers({
-                    "x-api-key": this.apiKey,
-                    accept: stream ? "text/event-stream" : "application/json",
-                });
-                const response = yield fetch(`${this.baseUrl}/${user}/${modelName}/predict${stream ? "/stream/" : ""}`, {
+                return this._send(`${this.baseUrl}/${user}/${modelName}/predict${stream ? "/stream/" : ""}`, {
                     method: "POST",
-                    headers,
-                    body: formData,
+                    headers: this._headers(stream ? "text/event-stream" : "application/json"),
+                    body: this._formData(preparedPayload),
                 });
-                if (!response.ok) {
-                    const errorBody = yield response.text();
-                    throw new FlyMyAIError(`Request failed: ${response.status} ${response.statusText}. Body: ${errorBody}`);
-                }
-                return response;
             });
         }
         _validateModelFormat(model) {
@@ -377,151 +529,187 @@
                 throw new FlyMyAIError('Model must be in the format "user/modelName".');
             }
         }
+        /** Kept for callers of 0.2.x: `retries` is the number of attempts, as before. */
         _createConnectionWithRetries(payload_1, model_1) {
-            return __awaiter(this, arguments, void 0, function* (payload, model, stream = false, retries = 3, timeout = 10000) {
-                for (let attempt = 0; attempt < retries; attempt++) {
-                    try {
-                        const responsePromise = this._createConnection(payload, model, stream);
-                        const response = yield Promise.race([
-                            responsePromise,
-                            new Promise((_, reject) => setTimeout(() => reject(new FlyMyAIError("Request timed out")), timeout)),
-                        ]);
-                        return response;
-                    }
-                    catch (error) {
-                        let errorMessage = "Unknown error occurred";
-                        if (error instanceof Error) {
-                            errorMessage = error.message;
+            return __awaiter(this, arguments, void 0, function* (payload, model, stream = false, retries = 3) {
+                this._validateModelFormat(model);
+                const [user, modelName] = model.split("/");
+                const preparedPayload = yield this._preparePayload(payload);
+                return this._send(`${this.baseUrl}/${user}/${modelName}/predict${stream ? "/stream/" : ""}`, {
+                    method: "POST",
+                    headers: this._headers(stream ? "text/event-stream" : "application/json"),
+                    body: this._formData(preparedPayload),
+                }, { maxRetries: Math.max(retries - 1, 0) });
+            });
+        }
+        /** The SSE data events of one response, parsed as they arrive (UTF-8 safe). */
+        _events(response) {
+            return __asyncGenerator(this, arguments, function* _events_1() {
+                var _a;
+                const reader = (_a = response.body) === null || _a === void 0 ? void 0 : _a.getReader();
+                if (!reader) {
+                    throw new FlyMyAIError("Failed to read response stream");
+                }
+                const decoder = new TextDecoder("utf-8");
+                const queue = [];
+                const parser = createParser((event) => {
+                    if (event.type === "event")
+                        queue.push(event.data);
+                });
+                let finished = false;
+                try {
+                    while (true) {
+                        const { done, value } = yield __await(reader.read());
+                        if (done) {
+                            parser.feed(decoder.decode());
                         }
-                        if (attempt === retries - 1) {
-                            throw new FlyMyAIError(`Failed after ${retries} attempts: ${errorMessage}`);
+                        else {
+                            parser.feed(decoder.decode(value, { stream: true }));
                         }
-                        console.log(`Attempt ${attempt + 1} failed: ${errorMessage}. Retrying...`);
+                        while (queue.length) {
+                            const data = queue.shift();
+                            let parsed;
+                            try {
+                                parsed = JSON.parse(data);
+                            }
+                            catch (_) {
+                                throw new FlyMyAISSEParseError(`Failed to parse SSE data: ${data}`);
+                            }
+                            yield yield __await(parsed);
+                        }
+                        if (done) {
+                            finished = true;
+                            return yield __await(void 0);
+                        }
                     }
                 }
-                throw new FlyMyAIError("Maximum retry attempts reached");
+                finally {
+                    if (!finished) {
+                        // The caller stopped early or the read failed: let the connection go.
+                        yield __await(reader.cancel().catch(() => undefined));
+                    }
+                    reader.releaseLock();
+                }
             });
         }
         predict(payload, model) {
             return __awaiter(this, void 0, void 0, function* () {
-                var _a;
-                try {
+                var _a, e_1, _b, _c;
+                // A response cut before its event is sent again (nothing reached the caller);
+                // once the event is here, it is the answer, as before.
+                for (let attempt = 0;; attempt++) {
                     const response = yield this._createConnection(payload, model);
-                    // Если ответ приходит как SSE (даже для обычных запросов)
-                    const reader = (_a = response.body) === null || _a === void 0 ? void 0 : _a.getReader();
-                    const decoder = new TextDecoder("utf-8");
-                    let result = "";
-                    if (!reader) {
-                        throw new FlyMyAIError("Failed to read response stream");
-                    }
-                    while (true) {
-                        const { done, value } = yield reader.read();
-                        if (done)
-                            break;
-                        result += decoder.decode(value);
-                    }
-                    // Извлекаем данные из SSE формата
-                    const jsonData = result
-                        .split("\n")
-                        .filter((line) => line.startsWith("data:"))
-                        .map((line) => {
+                    const events = [];
+                    let readError = null;
+                    try {
                         try {
-                            return JSON.parse(line.replace(/^data:\s*/, ""));
+                            for (var _d = true, _e = (e_1 = void 0, __asyncValues(this._events(response))), _f; _f = yield _e.next(), _a = _f.done, !_a; _d = true) {
+                                _c = _f.value;
+                                _d = false;
+                                const event = _c;
+                                events.push(event);
+                            }
                         }
-                        catch (e) {
-                            throw new FlyMyAIError(`Failed to parse SSE data: ${line}`);
+                        catch (e_1_1) { e_1 = { error: e_1_1 }; }
+                        finally {
+                            try {
+                                if (!_d && !_a && (_b = _e.return)) yield _b.call(_e);
+                            }
+                            finally { if (e_1) throw e_1.error; }
                         }
-                    });
-                    if (jsonData.length === 0) {
-                        throw new FlyMyAIError("No valid data events found in response");
                     }
-                    // Возвращаем последнее событие (или обрабатываем все)
-                    return jsonData[jsonData.length - 1];
-                }
-                catch (error) {
-                    if (error instanceof FlyMyAIError) {
-                        throw error;
+                    catch (error) {
+                        if (error instanceof FlyMyAISSEParseError)
+                            throw error;
+                        readError = error;
                     }
-                    if (error instanceof Error) {
-                        throw new FlyMyAIError(`Prediction failed: ${error.message}`);
+                    if (events.length) {
+                        // The last event, as before (an error event too: its status says so).
+                        return events[events.length - 1];
                     }
-                    else {
-                        throw new FlyMyAIError("Prediction failed due to an unknown error.");
+                    if (attempt < this.maxRetries) {
+                        yield sleep(retryDelayMs(attempt));
+                        continue;
                     }
+                    if (readError) {
+                        throw new FlyMyAIError(`Prediction failed: ${errorMessage(readError)}`);
+                    }
+                    throw new FlyMyAIError("No valid data events found in response");
                 }
             });
         }
         _createStream(response) {
             return __awaiter(this, void 0, void 0, function* () {
+                // Kept for callers of 0.2.x: the data of every event, encoded, then the end.
                 const encoder = new TextEncoder();
-                const decoder = new TextDecoder();
-                const readableStream = new ReadableStream({
-                    start(controller) {
+                const events = this._events(response);
+                return new ReadableStream({
+                    pull(controller) {
                         return __awaiter(this, void 0, void 0, function* () {
-                            var _a, e_1, _b, _c;
-                            const onParse = (event) => {
-                                if (event.type === "event") {
-                                    const data = event.data;
-                                    controller.enqueue(encoder.encode(data));
-                                }
-                            };
-                            if (response.status !== 200) {
-                                const data = {
-                                    status: response.status,
-                                    statusText: response.statusText,
-                                    body: yield response.text(),
-                                };
-                                console.log(`Error: received non-200 status code, ${JSON.stringify(data)}`);
+                            const { done, value } = yield events.next();
+                            if (done) {
                                 controller.close();
-                                return;
                             }
-                            const parser = createParser(onParse);
-                            try {
-                                for (var _d = true, _e = __asyncValues(response.body), _f; _f = yield _e.next(), _a = _f.done, !_a; _d = true) {
-                                    _c = _f.value;
-                                    _d = false;
-                                    const chunk = _c;
-                                    parser.feed(decoder.decode(chunk, { stream: true }));
-                                }
-                            }
-                            catch (e_1_1) { e_1 = { error: e_1_1 }; }
-                            finally {
-                                try {
-                                    if (!_d && !_a && (_b = _e.return)) yield _b.call(_e);
-                                }
-                                finally { if (e_1) throw e_1.error; }
+                            else {
+                                controller.enqueue(encoder.encode(JSON.stringify(value)));
                             }
                         });
                     },
                 });
-                return readableStream;
             });
         }
+        /**
+         * The stream's data events. Sent again only before its first event (a connection
+         * error, or a status the retry policy allows); after that a broken connection
+         * throws FlyMyAIStreamInterrupted and an error event FlyMyAIStreamError.
+         */
         stream(payload, model) {
             return __asyncGenerator(this, arguments, function* stream_1() {
-                try {
-                    const response = yield __await(this._createConnectionWithRetries(payload, model, true));
-                    const stream = yield __await(this._createStream(response));
-                    const reader = stream.getReader();
+                var _a, e_2, _b, _c;
+                let received = 0;
+                for (let attempt = 0;; attempt++) {
+                    const response = yield __await(this._createConnection(payload, model, true));
                     try {
-                        while (true) {
-                            const { done, value } = yield __await(reader.read());
-                            if (done)
-                                break;
-                            yield yield __await(JSON.parse(String.fromCharCode(...value)));
+                        try {
+                            for (var _d = true, _e = (e_2 = void 0, __asyncValues(this._events(response))), _f; _f = yield __await(_e.next()), _a = _f.done, !_a; _d = true) {
+                                _c = _f.value;
+                                _d = false;
+                                const event = _c;
+                                received += 1;
+                                if (isErrorEvent(event)) {
+                                    throw new FlyMyAIStreamError(`Stream error: ${JSON.stringify(event)}`, received, event);
+                                }
+                                yield yield __await(event);
+                            }
+                        }
+                        catch (e_2_1) { e_2 = { error: e_2_1 }; }
+                        finally {
+                            try {
+                                if (!_d && !_a && (_b = _e.return)) yield __await(_b.call(_e));
+                            }
+                            finally { if (e_2) throw e_2.error; }
                         }
                     }
-                    finally {
-                        reader.releaseLock();
+                    catch (error) {
+                        if (error instanceof FlyMyAIStreamError || error instanceof FlyMyAISSEParseError) {
+                            throw error;
+                        }
+                        if (received > 0) {
+                            throw new FlyMyAIStreamInterrupted(`The stream broke after ${received} event(s): ${errorMessage(error)}.` +
+                                " It is not sent again automatically.", received, error);
+                        }
+                        if (attempt < this.maxRetries) {
+                            yield __await(sleep(retryDelayMs(attempt)));
+                            continue;
+                        }
+                        throw new FlyMyAIError(`Streaming failed: ${errorMessage(error)}`);
                     }
-                }
-                catch (error) {
-                    if (error instanceof Error) {
-                        throw new FlyMyAIError(`Streaming failed: ${error.message}`);
+                    if (received === 0 && attempt < this.maxRetries) {
+                        // Closed before its first event: nothing reached the caller.
+                        yield __await(sleep(retryDelayMs(attempt)));
+                        continue;
                     }
-                    else {
-                        throw new FlyMyAIError("Streaming failed due to an unknown error.");
-                    }
+                    return yield __await(void 0);
                 }
             });
         }
@@ -529,38 +717,21 @@
             return __awaiter(this, arguments, void 0, function* (model = "", max_retries = 3) {
                 const [user, modelName] = model.split("/");
                 const url = `${this.baseUrl}/${user}/${modelName}/openapi-schema`;
-                for (let attempt = 0; attempt < max_retries; attempt++) {
-                    try {
-                        const response = yield fetch(url, {
-                            method: "GET",
-                            headers: {
-                                accept: "application/json",
-                                "x-api-key": this.apiKey,
-                            },
-                        });
-                        if (!response.ok) {
-                            throw new FlyMyAIError(`Failed to fetch OpenAPI schema. Server responded with status: ${response.statusText}`);
-                        }
-                        const schemaResponse = yield OpenAPISchemaResponse.fromResponse(response);
-                        return schemaResponse;
-                    }
-                    catch (error) {
-                        if (attempt === max_retries - 1) {
-                            if (error instanceof Error) {
-                                throw new FlyMyAIError(`Failed to fetch OpenAPI schema after ${max_retries} attempts: ${error.message}`);
-                            }
-                            else {
-                                throw new FlyMyAIError("Failed to fetch OpenAPI schema after maximum retries due to an unknown error.");
-                            }
-                        }
-                    }
+                try {
+                    const response = yield this._send(url, { method: "GET", headers: this._headers("application/json") }, { maxRetries: Math.max(max_retries - 1, 0) });
+                    return yield OpenAPISchemaResponse.fromResponse(response);
                 }
-                throw new FlyMyAIError("Failed to fetch OpenAPI schema after maximum retries.");
+                catch (error) {
+                    throw new FlyMyAIError(`Failed to fetch OpenAPI schema after ${max_retries} attempts: ${errorMessage(error)}`);
+                }
             });
         }
     }
 
     exports.FlyMyAI = FlyMyAI;
+    exports.FlyMyAIAPIError = FlyMyAIAPIError;
     exports.FlyMyAIError = FlyMyAIError;
+    exports.FlyMyAIStreamError = FlyMyAIStreamError;
+    exports.FlyMyAIStreamInterrupted = FlyMyAIStreamInterrupted;
 
 }));

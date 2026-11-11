@@ -121,6 +121,19 @@ describe("retries like the official OpenAI and Anthropic SDKs", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test("an error event in the gateway shape (status_code, detail) ends a stream with a typed error", async () => {
+    const event = "data: {\"detail\": \"provider failed\", \"status_code\": 502}\n\n";
+    const calls = plan(() => sse([CHUNK_1, event]));
+    await expect(drain(client().stream({ prompt: "hi" }, "u/p"))).rejects.toBeInstanceOf(FlyMyAIStreamError);
+    expect(calls.length).toBe(1);
+  });
+
+  test("predict still returns the last event, a gateway error event included (0.2.x contract)", async () => {
+    plan(() => sse(["data: {\"detail\": \"Predict is not available for this model\", \"status_code\": 421}\n\n"]));
+    const result: any = await client().predict({ prompt: "hi" }, "u/p");
+    expect(result.status_code).toBe(421);
+  });
+
   test("a 400 is not sent again", async () => {
     const calls = plan(() => json(400, { detail: "bad input" }));
     await expect(client().predict({ prompt: "hi" }, "owner/project")).rejects.toBeInstanceOf(
