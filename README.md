@@ -85,6 +85,47 @@ async function streamPredictions() {
 streamPredictions();
 ```
 
+### Retries and broken streams
+
+Since 0.3.0 the client sends a request again the way the official OpenAI and Anthropic
+SDKs do:
+
+- Only before the answer started: a connection error or timeout before the response
+  headers, or a status that allows it: 408, 409, 429 and every status from 500
+  (`maxRetries` extra attempts, default 2). A 400, 401, 404 or 422 is never re-sent.
+- The server decides when it says so: `x-should-retry: true|false` wins over the status,
+  and a JSON error body with `"retry_safe": false` stops it.
+- The wait honours `retry-after-ms` / `retry-after` up to two minutes, otherwise
+  exponential backoff from 0.5 s to 8 s with jitter. An attempt that times out
+  (`timeout`, default 600000 ms to the response headers) is aborted before the next one
+  starts, so two copies of a request never run at once.
+- A stream that has delivered an event is never sent again: the model may still be
+  running, and a second run would repeat the answer and its cost. A broken connection
+  throws `FlyMyAIStreamInterrupted` (`eventsReceived`), and an error event inside the
+  stream throws `FlyMyAIStreamError` (`data`); a status error throws `FlyMyAIAPIError`
+  (`status`, `body`, `headers`). All are `FlyMyAIError`s.
+- `asyncPredict(payload, model, { idempotencyKey })` sends one `Idempotency-Key` on every
+  attempt (yours, or one made for the call), so a submit sent again after a lost answer
+  replays the first job instead of starting a second paid one.
+
+```typescript
+import { FlyMyAI, FlyMyAIStreamInterrupted } from "flymyai-js-client";
+
+const client = new FlyMyAI({ apiKey: "YOUR_API_KEY", maxRetries: 2 });
+try {
+  for await (const result of client.stream<any>(payload, model)) {
+    console.log(result.output_data?.output?.[0] ?? "");
+  }
+} catch (error) {
+  if (error instanceof FlyMyAIStreamInterrupted) {
+    // Part of the answer arrived; retry the whole call yourself if a second run is fine.
+    console.error(`cut after ${error.eventsReceived} events`);
+  } else {
+    throw error;
+  }
+}
+```
+
 ### Long-Running Predictions with Polling
 
 For operations requiring extended processing time, use predictAsync with polling:

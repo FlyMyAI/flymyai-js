@@ -1,6 +1,6 @@
 {
   "name": "flymyai-js-client",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "",
   "main": "dist/my-library.umd.js",
   "module": "dist/my-library.esm.js",
